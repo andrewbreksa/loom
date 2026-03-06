@@ -9,7 +9,8 @@ package loom
 //	rt := l.Build()
 //	rt.Dispatch("attack", map[string]any{"target": "bob", "amount": 5})
 type Loom struct {
-	reg *Registry
+	reg       *Registry
+	telemetry TelemetryOptions
 }
 
 // New creates a new Loom assembler.
@@ -58,9 +59,16 @@ func (l *Loom) Module(m Module) *Loom {
 	return l
 }
 
+// WithTelemetry configures OpenTelemetry integration for runtimes built from
+// this Loom instance.
+func (l *Loom) WithTelemetry(options TelemetryOptions) *Loom {
+	l.telemetry = options
+	return l
+}
+
 // Build returns a Runtime initialized with all registered declarations.
 func (l *Loom) Build() *Runtime {
-	return newRuntime(l.reg)
+	return newRuntime(l.reg, l.telemetry)
 }
 
 // ── Module interface ───────────────────────────────────────────────────────

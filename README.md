@@ -126,6 +126,44 @@ decls := loom.Pair("opposite", [][2]string{{"north", "south"}})
 
 If `Permits` returns `false`, `Dispatch` returns `PermitError`.
 
+## OpenTelemetry Integration
+
+Loom can emit traces and metrics using OpenTelemetry. Integration is optional;
+if you do nothing, Loom uses the global no-op providers.
+
+```go
+import (
+	"context"
+
+	"github.com/andrewbreksa/loom"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+)
+
+tp := sdktrace.NewTracerProvider()
+defer tp.Shutdown(context.Background())
+
+rt := loom.New().
+	WithTelemetry(loom.TelemetryOptions{
+		TracerProvider:      tp,
+		InstrumentationName: "my-service/loom",
+	}).
+	Ref("x", 0).
+	Action("inc", loom.NewAction(
+		func(_ loom.StateView, _ map[string]any) bool { return true },
+		func(s loom.StateView, _ map[string]any) []loom.Rebind {
+			return []loom.Rebind{s.Rebind("x", loom.Int(s.Get("x"))+1)}
+		},
+	)).
+	Build()
+
+_ = rt.DispatchContext(context.Background(), "inc", nil)
+```
+
+Instrumented dispatches include:
+- Span name: `loom.dispatch`
+- Span attributes: `loom.action`, `loom.args_count`, `loom.result`, `loom.rebind_count`, `loom.watch_callback_count`
+- Metrics: `loom.dispatch.total`, `loom.dispatch.duration.seconds`, `loom.dispatch.rebinds`, `loom.dispatch.watch_callbacks`
+
 ## Event Sourcing and Replay
 
 Runtimes keep history and an event log:
@@ -161,9 +199,10 @@ go test -run TestChess ./...
 
 ## API Reference (At a Glance)
 
-- Assembly: `New`, `Ref`, `Refs`, `Derived`, `Watch`, `Action`, `Pattern`, `Module`, `Build`
-- Runtime: `Dispatch`, `Get`, `GetOr`, `Namespace`, `Length`, `Snapshot`, `History`, `EventLog`, `Replay`
+- Assembly: `New`, `Ref`, `Refs`, `Derived`, `Watch`, `Action`, `Pattern`, `Module`, `WithTelemetry`, `Build`
+- Runtime: `Dispatch`, `DispatchContext`, `Get`, `GetOr`, `Namespace`, `Length`, `Snapshot`, `History`, `EventLog`, `Replay`
 - Helpers: `NewAction`, `R`, `ForEach`, `Spread`, `Chain`, `Pair`
+- Telemetry: `TelemetryOptions`
 - Type coercions: `String`, `Int`, `Float`, `Bool`, `Slice`
 
 ## License

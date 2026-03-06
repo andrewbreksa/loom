@@ -1,9 +1,11 @@
 package loom
 
 import (
+	"context"
 	"fmt"
 	"path"
 	"strings"
+	"time"
 )
 
 // PermitError is returned when an action's Permits() returns false.
@@ -32,13 +34,15 @@ type Runtime struct {
 	history      []Env
 	eventLog     []Event
 	seq          int
+	telemetry    *runtimeTelemetry
 }
 
-func newRuntime(reg *Registry) *Runtime {
+func newRuntime(reg *Registry, telemetryOptions TelemetryOptions) *Runtime {
 	rt := &Runtime{
 		reg:          reg,
 		env:          NewEnv(),
 		derivedCache: make(map[string]any),
+		telemetry:    newRuntimeTelemetry(telemetryOptions),
 	}
 	rt.initEnv()
 	return rt
@@ -53,25 +57,49 @@ func (rt *Runtime) initEnv() {
 
 // Dispatch runs an action by name.
 func (rt *Runtime) Dispatch(name string, args map[string]any) error {
+	return rt.DispatchContext(context.Background(), name, args)
+}
+
+// DispatchContext runs an action by name with a caller-provided context for
+// telemetry propagation.
+func (rt *Runtime) DispatchContext(ctx context.Context, name string, args map[string]any) (err error) {
 	if args == nil {
 		args = map[string]any{}
 	}
+
+	ctx, span, started := rt.telemetry.startDispatch(ctx, name, args)
+	result := "ok"
+	rebindCount := 0
+	watchCallbacks := 0
+	defer func() {
+		rt.telemetry.endDispatch(ctx, span, name, result, rebindCount, watchCallbacks, time.Since(started), err)
+	}()
+
 	action, ok := rt.reg.Actions[name]
 	if !ok {
-		return fmt.Errorf("unknown action: %q", name)
+		result = "unknown_action"
+		err = fmt.Errorf("unknown action: %q", name)
+		return err
 	}
 
 	view := rt.stateView()
 
 	if !action.Permits(view, args) {
-		return PermitError{Action: name}
+		result = "not_permitted"
+		err = PermitError{Action: name}
+		return err
 	}
 
 	rebinds := action.Effect(view, args)
-	return rt.applyRebinds(rebinds, name, args)
+	rebindCount = len(rebinds)
+	watchCallbacks, err = rt.applyRebinds(ctx, rebinds, name, args)
+	if err != nil {
+		result = "error"
+	}
+	return err
 }
 
-func (rt *Runtime) applyRebinds(rebinds []Rebind, source string, args map[string]any) error {
+func (rt *Runtime) applyRebinds(ctx context.Context, rebinds []Rebind, source string, args map[string]any) (int, error) {
 	before := rt.env.Snapshot()
 	rt.history = append(rt.history, before)
 
@@ -81,7 +109,7 @@ func (rt *Runtime) applyRebinds(rebinds []Rebind, source string, args map[string
 	rt.recomputeDerived()
 
 	changed := changedKeys(before, rt.env)
-	rt.fireWatches(changed, source)
+	watchCallbacks := rt.fireWatches(ctx, changed, source)
 
 	rt.seq++
 	rt.eventLog = append(rt.eventLog, Event{
@@ -91,18 +119,20 @@ func (rt *Runtime) applyRebinds(rebinds []Rebind, source string, args map[string
 		Before: before,
 		After:  rt.env.Snapshot(),
 	})
-	return nil
+	return watchCallbacks, nil
 }
 
-func (rt *Runtime) fireWatches(changed map[string]bool, source string) {
+func (rt *Runtime) fireWatches(ctx context.Context, changed map[string]bool, source string) int {
 	var cascades [][]Rebind
+	watchCallbacks := 0
 
 	for _, watch := range rt.reg.Watches {
 		for key := range changed {
 			if matchPattern(watch.Pattern, key) {
-				view   := rt.stateView()
-				value  := rt.env.Get(key)
+				view := rt.stateView()
+				value := rt.env.Get(key)
 				result := watch.Fn(view, key, value)
+				watchCallbacks++
 				if len(result) > 0 {
 					cascades = append(cascades, result)
 				}
@@ -119,9 +149,10 @@ func (rt *Runtime) fireWatches(changed map[string]bool, source string) {
 		rt.recomputeDerived()
 		second := changedKeys(before, rt.env)
 		if len(second) > 0 {
-			rt.fireWatches(second, "watch:"+source)
+			watchCallbacks += rt.fireWatches(ctx, second, "watch:"+source)
 		}
 	}
+	return watchCallbacks
 }
 
 func (rt *Runtime) recomputeDerived() {
