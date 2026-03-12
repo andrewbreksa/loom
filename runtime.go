@@ -8,6 +8,28 @@ import (
 	"time"
 )
 
+// ── Invariant errors ───────────────────────────────────────────────────────
+
+// InvariantViolation holds a single invariant failure.
+type InvariantViolation struct {
+	Invariant string
+	Err       error
+}
+
+// InvariantError is returned when one or more invariants are violated after a
+// dispatch or signal emission settles.
+type InvariantError struct {
+	Violations []InvariantViolation
+}
+
+func (e InvariantError) Error() string {
+	msgs := make([]string, len(e.Violations))
+	for i, v := range e.Violations {
+		msgs[i] = fmt.Sprintf("%s: %s", v.Invariant, v.Err)
+	}
+	return "invariant violations: " + strings.Join(msgs, "; ")
+}
+
 // PermitError is returned when an action's Permits() returns false.
 type PermitError struct {
 	Action string
@@ -18,9 +40,12 @@ func (e PermitError) Error() string {
 }
 
 // Event is a record in the event log.
+// For action events, Action is set and Signal is empty.
+// For signal events, Signal is set and Action is empty.
 type Event struct {
 	Seq    int
 	Action string
+	Signal string
 	Args   map[string]any
 	Before Env
 	After  Env
@@ -101,6 +126,7 @@ func (rt *Runtime) DispatchContext(ctx context.Context, name string, args map[st
 
 func (rt *Runtime) applyRebinds(ctx context.Context, rebinds []Rebind, source string, args map[string]any) (int, error) {
 	before := rt.env.Snapshot()
+	savedCache := rt.snapshotDerivedCache()
 	rt.history = append(rt.history, before)
 
 	for _, r := range rebinds {
@@ -110,6 +136,13 @@ func (rt *Runtime) applyRebinds(ctx context.Context, rebinds []Rebind, source st
 
 	changed := changedKeys(before, rt.env)
 	watchCallbacks := rt.fireWatches(ctx, changed, source)
+
+	if inv := rt.checkInvariants(); inv != nil {
+		rt.env = before
+		rt.derivedCache = savedCache
+		rt.history = rt.history[:len(rt.history)-1]
+		return 0, *inv
+	}
 
 	rt.seq++
 	rt.eventLog = append(rt.eventLog, Event{
@@ -189,11 +222,80 @@ func (rt *Runtime) EventLog() []Event                      { return append([]Eve
 
 func (rt *Runtime) Replay(events []Event) error {
 	for _, e := range events {
-		if err := rt.Dispatch(e.Action, e.Args); err != nil {
+		var err error
+		if e.Signal != "" {
+			err = rt.Emit(e.Signal, e.Args)
+		} else {
+			err = rt.Dispatch(e.Action, e.Args)
+		}
+		if err != nil {
 			return fmt.Errorf("replay seq %d: %w", e.Seq, err)
 		}
 	}
 	return nil
+}
+
+// Emit fires a named signal into the runtime. Signal handlers may return
+// rebinds; these cascade through the normal watch/derived/invariant chain.
+// The signal is captured in the event log.
+func (rt *Runtime) Emit(name string, args map[string]any) error {
+	return rt.EmitContext(context.Background(), name, args)
+}
+
+// EmitContext is Emit with a caller-provided context for telemetry propagation.
+func (rt *Runtime) EmitContext(ctx context.Context, name string, args map[string]any) error {
+	if args == nil {
+		args = map[string]any{}
+	}
+
+	sig := Signal{Name: name, Args: args}
+	view := rt.stateView()
+
+	var rebinds []Rebind
+	for _, decl := range rt.reg.Signals {
+		if decl.Signal == name {
+			rebinds = append(rebinds, decl.Fn(view, sig)...)
+		}
+	}
+
+	_, err := rt.applySignal(ctx, sig, rebinds)
+	return err
+}
+
+func (rt *Runtime) applySignal(ctx context.Context, sig Signal, rebinds []Rebind) (int, error) {
+	before := rt.env.Snapshot()
+	savedCache := rt.snapshotDerivedCache()
+	rt.history = append(rt.history, before)
+
+	for _, r := range rebinds {
+		rt.env = rt.env.Set(r.Key, r.Value)
+	}
+	rt.recomputeDerived()
+
+	changed := changedKeys(before, rt.env)
+	watchCallbacks := rt.fireWatches(ctx, changed, "signal:"+sig.Name)
+
+	if inv := rt.checkInvariants(); inv != nil {
+		rt.env = before
+		rt.derivedCache = savedCache
+		rt.history = rt.history[:len(rt.history)-1]
+		return 0, *inv
+	}
+
+	rt.seq++
+	rt.eventLog = append(rt.eventLog, Event{
+		Seq:    rt.seq,
+		Signal: sig.Name,
+		Args:   sig.Args,
+		Before: before,
+		After:  rt.env.Snapshot(),
+	})
+	return watchCallbacks, nil
+}
+
+// Select returns all env keys matching the named selector.
+func (rt *Runtime) Select(name string) map[string]any {
+	return rt.stateView().Select(name)
 }
 
 // ── Internal ──────────────────────────────────────────────────────────────
@@ -203,7 +305,33 @@ func (rt *Runtime) stateView() StateView {
 		env:          rt.env,
 		derivedCache: rt.derivedCache,
 		patterns:     rt.reg.Patterns,
+		selectors:    rt.reg.Selectors,
 	}
+}
+
+func (rt *Runtime) snapshotDerivedCache() map[string]any {
+	cp := make(map[string]any, len(rt.derivedCache))
+	for k, v := range rt.derivedCache {
+		cp[k] = v
+	}
+	return cp
+}
+
+func (rt *Runtime) checkInvariants() *InvariantError {
+	if len(rt.reg.Invariants) == 0 {
+		return nil
+	}
+	view := rt.stateView()
+	var violations []InvariantViolation
+	for _, decl := range rt.reg.Invariants {
+		for _, err := range decl.Fn(view) {
+			violations = append(violations, InvariantViolation{Invariant: decl.Name, Err: err})
+		}
+	}
+	if len(violations) == 0 {
+		return nil
+	}
+	return &InvariantError{Violations: violations}
 }
 
 func changedKeys(before, after Env) map[string]bool {
@@ -237,6 +365,7 @@ type runtimeView struct {
 	env          Env
 	derivedCache map[string]any
 	patterns     map[string]PatternFn
+	selectors    map[string]SelectorDecl
 }
 
 func (v *runtimeView) Get(key string) any {
@@ -279,4 +408,18 @@ func (v *runtimeView) Apply(description any) []Rebind {
 		return result
 	}
 	return nil
+}
+
+func (v *runtimeView) Select(name string) map[string]any {
+	sel, ok := v.selectors[name]
+	if !ok {
+		return nil
+	}
+	result := make(map[string]any)
+	for k, val := range v.env.ToMap() {
+		if matchPattern(sel.Pattern, k) {
+			result[k] = val
+		}
+	}
+	return result
 }

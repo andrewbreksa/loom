@@ -4,17 +4,21 @@ package loom
 // Modules register into a Registry.
 // Loom assembles them into a Runtime.
 type Registry struct {
-	Refs     []RefDecl
-	Derived  []DerivedDecl
-	Watches  []WatchDecl
-	Actions  map[string]Action
-	Patterns map[string]PatternFn
+	Refs       []RefDecl
+	Derived    []DerivedDecl
+	Watches    []WatchDecl
+	Actions    map[string]Action
+	Patterns   map[string]PatternFn
+	Invariants []InvariantDecl
+	Signals    []SignalDecl
+	Selectors  map[string]SelectorDecl
 }
 
 func NewRegistry() *Registry {
 	return &Registry{
-		Actions:  make(map[string]Action),
-		Patterns: make(map[string]PatternFn),
+		Actions:   make(map[string]Action),
+		Patterns:  make(map[string]PatternFn),
+		Selectors: make(map[string]SelectorDecl),
 	}
 }
 
@@ -38,14 +42,31 @@ func (r *Registry) AddPattern(name string, fn PatternFn) {
 	r.Patterns[name] = fn
 }
 
+func (r *Registry) AddInvariant(name string, fn InvariantFn) {
+	r.Invariants = append(r.Invariants, InvariantDecl{Name: name, Fn: fn})
+}
+
+func (r *Registry) AddSignal(signal string, name string, fn OnSignalFn) {
+	r.Signals = append(r.Signals, SignalDecl{Signal: signal, Name: name, Fn: fn})
+}
+
+func (r *Registry) AddSelector(name string, pattern string) {
+	r.Selectors[name] = SelectorDecl{Name: name, Pattern: pattern}
+}
+
 func (r *Registry) Merge(other *Registry) {
-	r.Refs    = append(r.Refs, other.Refs...)
-	r.Derived = append(r.Derived, other.Derived...)
-	r.Watches = append(r.Watches, other.Watches...)
+	r.Refs       = append(r.Refs, other.Refs...)
+	r.Derived    = append(r.Derived, other.Derived...)
+	r.Watches    = append(r.Watches, other.Watches...)
+	r.Invariants = append(r.Invariants, other.Invariants...)
+	r.Signals    = append(r.Signals, other.Signals...)
 	for k, v := range other.Actions {
 		r.Actions[k] = v
 	}
 	for k, v := range other.Patterns {
 		r.Patterns[k] = v
+	}
+	for k, v := range other.Selectors {
+		r.Selectors[k] = v
 	}
 }
