@@ -88,10 +88,51 @@ func ForEach(ns map[string]any, fn ForFn) []Rebind {
 // ApplyFn is the logic-layer boundary.
 type ApplyFn func(description any) []Rebind
 
+// ── 8. Invariant ──────────────────────────────────────────────────────────
+
+// InvariantFn is a global rule evaluated on settled state after each dispatch
+// or signal emission. Return nil or an empty slice for success; return errors
+// to signal violations.
+type InvariantFn func(state StateView) []error
+
+// InvariantDecl binds a name to an InvariantFn.
+type InvariantDecl struct {
+	Name string
+	Fn   InvariantFn
+}
+
+// ── 9. Signal ─────────────────────────────────────────────────────────────
+
+// Signal is a first-class occurrence emitted into the runtime.
+// Signals model facts that happened even when no ref changes materially.
+type Signal struct {
+	Name string
+	Args map[string]any
+}
+
+// OnSignalFn handles an emitted signal and may return rebinds.
+type OnSignalFn func(state StateView, sig Signal) []Rebind
+
+// SignalDecl registers a handler for a named signal.
+type SignalDecl struct {
+	Signal string
+	Name   string
+	Fn     OnSignalFn
+}
+
+// ── 10. Selector ──────────────────────────────────────────────────────────
+
+// SelectorDecl is a named, reusable scope over refs.
+// The Pattern uses the same dot-separated glob syntax as Watch patterns.
+type SelectorDecl struct {
+	Name    string
+	Pattern string
+}
+
 // ── StateView ──────────────────────────────────────────────────────────────
 
 // StateView is the read-only view of the env exposed to Action, Watch,
-// and Derived functions.
+// Derived, Invariant, and OnSignal functions.
 type StateView interface {
 	Get(key string) any
 	GetOr(key string, def any) any
@@ -101,4 +142,6 @@ type StateView interface {
 	Pattern(name string, args ...any) []Rebind
 	Rebind(key string, value any) Rebind
 	Apply(description any) []Rebind
+	// Select returns all env keys matching the named selector.
+	Select(name string) map[string]any
 }

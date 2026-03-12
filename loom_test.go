@@ -380,6 +380,501 @@ func TestTicTacToe(t *testing.T) {
 	}
 }
 
+// ── Invariant ──────────────────────────────────────────────────────────────
+
+func TestInvariantPassesOnValidState(t *testing.T) {
+	rt := loom.New().
+		Ref("ledger.debit", 0).Ref("ledger.credit", 0).
+		Invariant("balanced_ledger", func(s loom.StateView) []error {
+			debit := loom.Int(s.Get("ledger.debit"))
+			credit := loom.Int(s.Get("ledger.credit"))
+			if debit != credit {
+				return []error{fmt.Errorf("debit %d ≠ credit %d", debit, credit)}
+			}
+			return nil
+		}).
+		Action("transfer", loom.NewAction(
+			func(_ loom.StateView, _ map[string]any) bool { return true },
+			func(s loom.StateView, args map[string]any) []loom.Rebind {
+				amount := loom.Int(args["amount"])
+				return []loom.Rebind{
+					s.Rebind("ledger.debit", loom.Int(s.Get("ledger.debit"))+amount),
+					s.Rebind("ledger.credit", loom.Int(s.Get("ledger.credit"))+amount),
+				}
+			},
+		)).
+		Build()
+
+	if err := rt.Dispatch("transfer", map[string]any{"amount": 100}); err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+	if loom.Int(rt.Get("ledger.debit")) != 100 {
+		t.Error("debit should be 100")
+	}
+}
+
+func TestInvariantFailsOnViolation(t *testing.T) {
+	rt := loom.New().
+		Ref("ledger.debit", 0).Ref("ledger.credit", 0).
+		Invariant("balanced_ledger", func(s loom.StateView) []error {
+			debit := loom.Int(s.Get("ledger.debit"))
+			credit := loom.Int(s.Get("ledger.credit"))
+			if debit != credit {
+				return []error{fmt.Errorf("debit %d ≠ credit %d", debit, credit)}
+			}
+			return nil
+		}).
+		Action("bad_debit", loom.NewAction(
+			func(_ loom.StateView, _ map[string]any) bool { return true },
+			func(s loom.StateView, args map[string]any) []loom.Rebind {
+				// only updates debit, leaving ledger unbalanced
+				return []loom.Rebind{
+					s.Rebind("ledger.debit", loom.Int(s.Get("ledger.debit"))+loom.Int(args["amount"])),
+				}
+			},
+		)).
+		Build()
+
+	err := rt.Dispatch("bad_debit", map[string]any{"amount": 50})
+	if err == nil {
+		t.Fatal("expected InvariantError")
+	}
+	invErr, ok := err.(loom.InvariantError)
+	if !ok {
+		t.Fatalf("expected InvariantError, got %T: %v", err, err)
+	}
+	if len(invErr.Violations) != 1 || invErr.Violations[0].Invariant != "balanced_ledger" {
+		t.Errorf("unexpected violations: %v", invErr.Violations)
+	}
+}
+
+func TestInvariantRollsBackStateOnFailure(t *testing.T) {
+	rt := loom.New().
+		Ref("ledger.debit", 0).Ref("ledger.credit", 0).
+		Invariant("balanced_ledger", func(s loom.StateView) []error {
+			d, c := loom.Int(s.Get("ledger.debit")), loom.Int(s.Get("ledger.credit"))
+			if d != c {
+				return []error{fmt.Errorf("unbalanced")}
+			}
+			return nil
+		}).
+		Action("bad_debit", loom.NewAction(
+			func(_ loom.StateView, _ map[string]any) bool { return true },
+			func(s loom.StateView, _ map[string]any) []loom.Rebind {
+				return []loom.Rebind{s.Rebind("ledger.debit", 99)}
+			},
+		)).
+		Build()
+
+	_ = rt.Dispatch("bad_debit", nil)
+	// State must have been rolled back
+	if loom.Int(rt.Get("ledger.debit")) != 0 {
+		t.Errorf("state should have rolled back, got debit=%v", rt.Get("ledger.debit"))
+	}
+	if len(rt.History()) != 0 {
+		t.Errorf("history should be empty after rollback, got %d entries", len(rt.History()))
+	}
+}
+
+func TestInvariantOrderCannotBeBothPaidAndCancelled(t *testing.T) {
+	rt := loom.New().
+		Ref("order.paid", false).Ref("order.cancelled", false).
+		Invariant("order_state", func(s loom.StateView) []error {
+			if loom.Bool(s.Get("order.paid")) && loom.Bool(s.Get("order.cancelled")) {
+				return []error{fmt.Errorf("order cannot be both paid and cancelled")}
+			}
+			return nil
+		}).
+		Action("pay", loom.NewAction(
+			func(_ loom.StateView, _ map[string]any) bool { return true },
+			func(s loom.StateView, _ map[string]any) []loom.Rebind {
+				return []loom.Rebind{s.Rebind("order.paid", true)}
+			},
+		)).
+		Action("cancel", loom.NewAction(
+			func(_ loom.StateView, _ map[string]any) bool { return true },
+			func(s loom.StateView, _ map[string]any) []loom.Rebind {
+				return []loom.Rebind{s.Rebind("order.cancelled", true)}
+			},
+		)).
+		Build()
+
+	if err := rt.Dispatch("pay", nil); err != nil {
+		t.Fatal(err)
+	}
+	// Attempting to cancel a paid order should violate the invariant
+	err := rt.Dispatch("cancel", nil)
+	if _, ok := err.(loom.InvariantError); !ok {
+		t.Fatalf("expected InvariantError, got %T: %v", err, err)
+	}
+	// paid should still be true (rollback kept it from both being true)
+	if !loom.Bool(rt.Get("order.paid")) {
+		t.Error("order.paid should still be true after rollback")
+	}
+}
+
+func TestInvariantRunsOnSettledState(t *testing.T) {
+	// Invariant should see the fully settled state including cascaded watch changes.
+	watchFired := false
+	rt := loom.New().
+		Ref("counter", 0).Ref("doubled", 0).
+		Watch("counter", func(s loom.StateView, _ string, value any) []loom.Rebind {
+			watchFired = true
+			return []loom.Rebind{s.Rebind("doubled", loom.Int(value)*2)}
+		}).
+		Invariant("doubled_is_even", func(s loom.StateView) []error {
+			d := loom.Int(s.Get("doubled"))
+			if d%2 != 0 {
+				return []error{fmt.Errorf("doubled=%d is not even", d)}
+			}
+			return nil
+		}).
+		Action("inc", loom.NewAction(
+			func(_ loom.StateView, _ map[string]any) bool { return true },
+			func(s loom.StateView, args map[string]any) []loom.Rebind {
+				return []loom.Rebind{s.Rebind("counter", loom.Int(args["n"]))}
+			},
+		)).
+		Build()
+
+	if err := rt.Dispatch("inc", map[string]any{"n": 3}); err != nil {
+		t.Fatalf("expected success: %v", err)
+	}
+	if !watchFired {
+		t.Error("watch should have fired")
+	}
+	// doubled = 6, even → invariant should pass
+	if loom.Int(rt.Get("doubled")) != 6 {
+		t.Errorf("doubled should be 6, got %v", rt.Get("doubled"))
+	}
+}
+
+// ── Signal ─────────────────────────────────────────────────────────────────
+
+func TestSignalEmitWithNoHandlers(t *testing.T) {
+	rt := loom.New().
+		Ref("x", 0).
+		Build()
+
+	// Emitting a signal with no handlers should not error.
+	if err := rt.Emit("payment_authorized", map[string]any{"amount": 100}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Signal should appear in the event log.
+	log := rt.EventLog()
+	if len(log) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(log))
+	}
+	if log[0].Signal != "payment_authorized" {
+		t.Errorf("expected signal=payment_authorized, got %q", log[0].Signal)
+	}
+	if log[0].Action != "" {
+		t.Errorf("expected empty action for signal event, got %q", log[0].Action)
+	}
+}
+
+func TestSignalHandlerReturnsRebinds(t *testing.T) {
+	rt := loom.New().
+		Ref("balance", 0).
+		OnSignal("payment_authorized", func(s loom.StateView, sig loom.Signal) []loom.Rebind {
+			amount := loom.Int(sig.Args["amount"])
+			return []loom.Rebind{s.Rebind("balance", loom.Int(s.Get("balance"))+amount)}
+		}).
+		Build()
+
+	if err := rt.Emit("payment_authorized", map[string]any{"amount": 150}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if loom.Int(rt.Get("balance")) != 150 {
+		t.Errorf("balance should be 150, got %v", rt.Get("balance"))
+	}
+}
+
+func TestSignalTriggersWatchCascade(t *testing.T) {
+	rt := loom.New().
+		Ref("balance", 0).Ref("high_water", 0).
+		OnSignal("payment_authorized", func(s loom.StateView, sig loom.Signal) []loom.Rebind {
+			amount := loom.Int(sig.Args["amount"])
+			return []loom.Rebind{s.Rebind("balance", loom.Int(s.Get("balance"))+amount)}
+		}).
+		Watch("balance", func(s loom.StateView, _ string, value any) []loom.Rebind {
+			if v := loom.Int(value); v > loom.Int(s.Get("high_water")) {
+				return []loom.Rebind{s.Rebind("high_water", v)}
+			}
+			return nil
+		}).
+		Build()
+
+	rt.Emit("payment_authorized", map[string]any{"amount": 200})
+	if loom.Int(rt.Get("high_water")) != 200 {
+		t.Errorf("high_water should be 200, got %v", rt.Get("high_water"))
+	}
+}
+
+func TestSignalCapturedInEventLog(t *testing.T) {
+	rt := loom.New().Build()
+
+	rt.Emit("invite_received", map[string]any{"from": "bob"})
+	rt.Emit("invite_received", map[string]any{"from": "carol"})
+
+	log := rt.EventLog()
+	if len(log) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(log))
+	}
+	for _, e := range log {
+		if e.Signal != "invite_received" {
+			t.Errorf("expected signal=invite_received, got %q", e.Signal)
+		}
+	}
+}
+
+func TestSignalReplay(t *testing.T) {
+	l := loom.New().
+		Ref("count", 0).
+		OnSignal("tick", func(s loom.StateView, _ loom.Signal) []loom.Rebind {
+			return []loom.Rebind{s.Rebind("count", loom.Int(s.Get("count"))+1)}
+		})
+
+	rt := l.Build()
+	rt.Emit("tick", nil)
+	rt.Emit("tick", nil)
+	rt.Emit("tick", nil)
+
+	if loom.Int(rt.Get("count")) != 3 {
+		t.Errorf("count should be 3, got %v", rt.Get("count"))
+	}
+
+	rt2 := l.Build()
+	if err := rt2.Replay(rt.EventLog()); err != nil {
+		t.Fatalf("replay failed: %v", err)
+	}
+	if loom.Int(rt2.Get("count")) != 3 {
+		t.Errorf("replay count should be 3, got %v", rt2.Get("count"))
+	}
+}
+
+func TestSignalInvariantCheck(t *testing.T) {
+	rt := loom.New().
+		Ref("balance", 100).
+		Invariant("non_negative", func(s loom.StateView) []error {
+			if loom.Int(s.Get("balance")) < 0 {
+				return []error{fmt.Errorf("balance cannot be negative")}
+			}
+			return nil
+		}).
+		OnSignal("withdraw", func(s loom.StateView, sig loom.Signal) []loom.Rebind {
+			amount := loom.Int(sig.Args["amount"])
+			return []loom.Rebind{s.Rebind("balance", loom.Int(s.Get("balance"))-amount)}
+		}).
+		Build()
+
+	// Valid withdrawal
+	if err := rt.Emit("withdraw", map[string]any{"amount": 50}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if loom.Int(rt.Get("balance")) != 50 {
+		t.Errorf("balance should be 50, got %v", rt.Get("balance"))
+	}
+
+	// Invalid withdrawal (would make balance negative)
+	err := rt.Emit("withdraw", map[string]any{"amount": 200})
+	if _, ok := err.(loom.InvariantError); !ok {
+		t.Fatalf("expected InvariantError, got %T: %v", err, err)
+	}
+	// Balance should remain at 50 (rollback)
+	if loom.Int(rt.Get("balance")) != 50 {
+		t.Errorf("balance should still be 50 after rollback, got %v", rt.Get("balance"))
+	}
+}
+
+// ── Selector ───────────────────────────────────────────────────────────────
+
+func TestSelectorMatchingBehavior(t *testing.T) {
+	rt := loom.New().
+		Ref("player.alice.health", 100).
+		Ref("player.alice.mana", 50).
+		Ref("player.bob.health", 80).
+		Ref("player.bob.mana", 30).
+		Ref("game.state", "active").
+		// "player" prefix selector — matches any key with "player." prefix
+		Selector("players", "player").
+		Build()
+
+	players := rt.Select("players")
+	if len(players) != 4 {
+		t.Errorf("expected 4 player keys, got %d: %v", len(players), players)
+	}
+	// game.state should not be in selector
+	if _, ok := players["game.state"]; ok {
+		t.Error("game.state should not be in players selector")
+	}
+}
+
+func TestSelectorReturnsNilForUnknown(t *testing.T) {
+	rt := loom.New().Build()
+	if rt.Select("nonexistent") != nil {
+		t.Error("unknown selector should return nil")
+	}
+}
+
+func TestSelectorUsedInAction(t *testing.T) {
+	rt := loom.New().
+		Ref("player.alice.health", 100).
+		Ref("player.bob.health", 80).
+		Selector("players", "player.*.health").
+		Action("heal_all", loom.NewAction(
+			func(_ loom.StateView, _ map[string]any) bool { return true },
+			func(s loom.StateView, args map[string]any) []loom.Rebind {
+				amount := loom.Int(args["amount"])
+				return loom.ForEach(s.Select("players"), func(key string, value any) []loom.Rebind {
+					return []loom.Rebind{s.Rebind(key, loom.Int(value)+amount)}
+				})
+			},
+		)).
+		Build()
+
+	if err := rt.Dispatch("heal_all", map[string]any{"amount": 10}); err != nil {
+		t.Fatal(err)
+	}
+	if loom.Int(rt.Get("player.alice.health")) != 110 {
+		t.Errorf("alice.health should be 110, got %v", rt.Get("player.alice.health"))
+	}
+	if loom.Int(rt.Get("player.bob.health")) != 90 {
+		t.Errorf("bob.health should be 90, got %v", rt.Get("player.bob.health"))
+	}
+}
+
+func TestSelectorUsedInDerived(t *testing.T) {
+	rt := loom.New().
+		Ref("player.alice.score", 30).
+		Ref("player.bob.score", 50).
+		Ref("player.carol.score", 20).
+		Selector("scores", "player.*.score").
+		Derived("game.total_score", func(s loom.StateView) any {
+			total := 0
+			for _, v := range s.Select("scores") {
+				total += loom.Int(v)
+			}
+			return total
+		}).
+		Action("add_score", loom.NewAction(
+			func(_ loom.StateView, _ map[string]any) bool { return true },
+			func(s loom.StateView, args map[string]any) []loom.Rebind {
+				player := loom.String(args["player"])
+				amount := loom.Int(args["amount"])
+				key := "player." + player + ".score"
+				return []loom.Rebind{s.Rebind(key, loom.Int(s.Get(key))+amount)}
+			},
+		)).
+		Build()
+
+	if loom.Int(rt.Get("game.total_score")) != 100 {
+		t.Errorf("initial total_score should be 100, got %v", rt.Get("game.total_score"))
+	}
+	rt.Dispatch("add_score", map[string]any{"player": "alice", "amount": 10})
+	if loom.Int(rt.Get("game.total_score")) != 110 {
+		t.Errorf("total_score should be 110, got %v", rt.Get("game.total_score"))
+	}
+}
+
+func TestSelectorUsedInWatch(t *testing.T) {
+	rt := loom.New().
+		Ref("dialog.a.active", true).
+		Ref("dialog.b.active", false).
+		Ref("active_count", 0).
+		Selector("dialogs", "dialog.*.active").
+		Watch("dialog.*.active", func(s loom.StateView, _ string, _ any) []loom.Rebind {
+			count := 0
+			for _, v := range s.Select("dialogs") {
+				if loom.Bool(v) {
+					count++
+				}
+			}
+			return []loom.Rebind{s.Rebind("active_count", count)}
+		}).
+		Action("toggle_dialog", loom.NewAction(
+			func(_ loom.StateView, _ map[string]any) bool { return true },
+			func(s loom.StateView, args map[string]any) []loom.Rebind {
+				key := "dialog." + loom.String(args["id"]) + ".active"
+				return []loom.Rebind{s.Rebind(key, !loom.Bool(s.Get(key)))}
+			},
+		)).
+		Build()
+
+	if loom.Int(rt.Get("active_count")) != 0 {
+		t.Errorf("initial active_count should be 0, got %v", rt.Get("active_count"))
+	}
+	rt.Dispatch("toggle_dialog", map[string]any{"id": "b"})
+	if loom.Int(rt.Get("active_count")) != 2 {
+		t.Errorf("active_count should be 2, got %v", rt.Get("active_count"))
+	}
+}
+
+// ── Combined example: Invariant + Signal + Selector ─────────────────────────
+
+func TestAllThreePrimitivesTogether(t *testing.T) {
+	// A simple payment system: players have balances, payments are emitted as
+	// signals, a selector targets all balances, and an invariant ensures no
+	// balance goes negative.
+
+	rt := loom.New().
+		Ref("wallet.alice", 200).
+		Ref("wallet.bob", 100).
+		Selector("wallets", "wallet.*").
+		OnSignal("payment", func(s loom.StateView, sig loom.Signal) []loom.Rebind {
+			from := loom.String(sig.Args["from"])
+			to := loom.String(sig.Args["to"])
+			amount := loom.Int(sig.Args["amount"])
+			fromKey := "wallet." + from
+			toKey := "wallet." + to
+			return []loom.Rebind{
+				s.Rebind(fromKey, loom.Int(s.Get(fromKey))-amount),
+				s.Rebind(toKey, loom.Int(s.Get(toKey))+amount),
+			}
+		}).
+		Derived("total_balance", func(s loom.StateView) any {
+			total := 0
+			for _, v := range s.Select("wallets") {
+				total += loom.Int(v)
+			}
+			return total
+		}).
+		Invariant("no_overdraft", func(s loom.StateView) []error {
+			var errs []error
+			for k, v := range s.Select("wallets") {
+				if loom.Int(v) < 0 {
+					errs = append(errs, fmt.Errorf("%s overdrawn: %d", k, loom.Int(v)))
+				}
+			}
+			return errs
+		}).
+		Build()
+
+	// Valid payment
+	if err := rt.Emit("payment", map[string]any{"from": "alice", "to": "bob", "amount": 50}); err != nil {
+		t.Fatalf("valid payment failed: %v", err)
+	}
+	if loom.Int(rt.Get("wallet.alice")) != 150 {
+		t.Errorf("alice should have 150, got %v", rt.Get("wallet.alice"))
+	}
+	if loom.Int(rt.Get("wallet.bob")) != 150 {
+		t.Errorf("bob should have 150, got %v", rt.Get("wallet.bob"))
+	}
+	if loom.Int(rt.Get("total_balance")) != 300 {
+		t.Errorf("total_balance should be 300, got %v", rt.Get("total_balance"))
+	}
+
+	// Overdraft payment — invariant should block it
+	err := rt.Emit("payment", map[string]any{"from": "bob", "to": "alice", "amount": 500})
+	if _, ok := err.(loom.InvariantError); !ok {
+		t.Fatalf("expected InvariantError, got %T: %v", err, err)
+	}
+	// Bob's balance should be unchanged (rolled back)
+	if loom.Int(rt.Get("wallet.bob")) != 150 {
+		t.Errorf("bob should still have 150 after rollback, got %v", rt.Get("wallet.bob"))
+	}
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────
 
 type transferAction struct{}

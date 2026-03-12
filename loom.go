@@ -53,6 +53,27 @@ func (l *Loom) Pattern(name string, fn PatternFn) *Loom {
 	return l
 }
 
+// Invariant registers a global rule evaluated on settled state after each
+// dispatch or signal emission. Dispatch fails if any invariant returns errors.
+func (l *Loom) Invariant(name string, fn InvariantFn) *Loom {
+	l.reg.AddInvariant(name, fn)
+	return l
+}
+
+// OnSignal registers a handler for the named signal.
+// Handlers may return rebinds that cascade through the normal watch/derived chain.
+func (l *Loom) OnSignal(signal string, fn OnSignalFn) *Loom {
+	l.reg.AddSignal(signal, signal, fn)
+	return l
+}
+
+// Selector registers a named, reusable scope over refs identified by pattern.
+// The pattern uses the same dot-separated glob syntax as Watch patterns.
+func (l *Loom) Selector(name string, pattern string) *Loom {
+	l.reg.AddSelector(name, pattern)
+	return l
+}
+
 // Module loads all declarations from a Module.
 func (l *Loom) Module(m Module) *Loom {
 	l.reg.Merge(m.Register())
